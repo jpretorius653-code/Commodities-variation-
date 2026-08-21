@@ -2642,7 +2642,7 @@ var qrcode = function() {
 // Format is deliberate: no spaces around '=', single quotes, one line —
 // the workflow greps for it.
 // ══════════════════════════════════════════════════════════
-const RENDERER_BUILD='9.6.3';
+const RENDERER_BUILD='9.6.4';
 window.RENDERER_BUILD=RENDERER_BUILD;
 // ══════════════════════════════════════════════════════════
 // DEBUG CONSOLE — permanent, toggleable diagnostic panel.
@@ -5065,6 +5065,31 @@ async function rawApplyToBridge(){
 // ══════════════════════════════════════════════════════════
 
 // Connect to a WeighBox WebSocket (from box or manually entered URL)
+/* Demand-mode polling over ScaleLink.
+   USB and TCP both write the poll command straight down the wire; the box
+   path could not, because a WebSocket frame is not a serial byte stream. The
+   command is wrapped so the ESP32 knows to forward it to its RS232 port:
+
+       {"cmd":"serial","data":"KPRINT\r\n"}
+
+   The firmware must handle cmd=="serial" by writing data to Serial. Without
+   that handler this is harmless — the box just ignores an unknown message. */
+let boxPollTimers={};
+function stopBoxPoll(bi){ if(boxPollTimers[bi]){ clearInterval(boxPollTimers[bi]); delete boxPollTimers[bi]; } }
+function startBoxPoll(sock, bi){
+  stopBoxPoll(bi);
+  const bc=cfg.bridges[bi]||{};
+  if(!bc.pollCmd) return;                       // streaming indicator: nothing to send
+  const data=expandPoll(bc.pollCmd);            // <CR><LF> etc -> real bytes
+  const send=()=>{
+    if(!sock || sock.readyState!==1){ stopBoxPoll(bi); return; }
+    try{ sock.send(JSON.stringify({cmd:'serial', data})); }
+    catch(e){ console.warn('[box] poll send failed: '+e.message); }
+  };
+  send();
+  boxPollTimers[bi]=setInterval(send, Math.max(250, parseInt(bc.pollMs)||1000));
+}
+
 function connectBox(url, bi){
   bi = bi ?? activeBridge;
   if(!url) return;
@@ -5077,6 +5102,7 @@ function connectBox(url, bi){
       setPill('📦 WeighBox live','rgba(27,122,67,.15)','#4ADE80', bi);
       toast('WeighBox connected on Bridge '+(bi+1),'success');
       sock.send(JSON.stringify({cmd:'ping'}));
+      startBoxPoll(sock, bi);        // demand-mode indicators (920i KPRINT etc.)
     };
     sock.onmessage = e => {
       try{
@@ -5110,6 +5136,7 @@ function connectBox(url, bi){
 }
 
 function disconnectBox(bi){
+  stopBoxPoll(bi);
   clearTimeout(boxReconnTimers[bi]);
   boxReconnTimers[bi] = null;
   if(boxSocks[bi]){ try{ boxSocks[bi].close(); }catch{} boxSocks[bi]=null; }
