@@ -255,10 +255,13 @@ tr:hover td{background:#f7fafd}
   <div class="fov-card">
     <div class="fov-logo" id="act-logo"></div>
     <div class="fov-title">ISS Weighbridge</div>
-    <div class="fov-sub">Enter your activation code to unlock this software</div>
-    <div class="field"><label>Activation Code</label>
-      <input id="act-input" placeholder="e.g. ISS2025" autocomplete="off" onkeydown="if(event.key==='Enter')doActivate()"/>
+    <div class="fov-sub">Enter your installation code to unlock this software</div>
+    <div class="field"><label>Installation Code</label>
+      <input id="act-input" type="password" inputmode="text" placeholder="••••••••"
+             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+             onkeydown="if(event.key==='Enter')doActivate()"/>
     </div>
+    <div id="act-fail" style="text-align:center;margin-top:8px;font-size:11px;color:#C0392B;min-height:14px"></div>
     <button class="btn btn-navy btn-full" style="margin-top:6px" onclick="doActivate()">🔓 Activate</button>
     <div style="text-align:center;margin-top:12px;font-size:11px;color:var(--text3)">Contact Industrial Scale Solutions for your activation code</div>
   </div>
@@ -2642,7 +2645,7 @@ var qrcode = function() {
 // Format is deliberate: no spaces around '=', single quotes, one line —
 // the workflow greps for it.
 // ══════════════════════════════════════════════════════════
-const RENDERER_BUILD='9.6.9';
+const RENDERER_BUILD='9.7.3';
 window.RENDERER_BUILD=RENDERER_BUILD;
 // ══════════════════════════════════════════════════════════
 // DEBUG CONSOLE — permanent, toggleable diagnostic panel.
@@ -2812,7 +2815,17 @@ function recordPinFail(userId){
 }
 function clearPinFail(userId){ delete _pinFails[userId]; }
 
-const DEFAULT_ACT_HASH='223e5b261379358f4da053ab1b92bc4043450f523323a33f515e7870de20fd3b';   // SHA-256 salted hash of 'ISS2025'
+// ── LICENCE CODES ─────────────────────────────────────────────────────
+// Salted SHA-256 only — the plaintext is not in this file. Two stages:
+//   phase 1  installation, entered once on a fresh PC
+//   phase 2  a second authorisation demanded a day later, so a copy that
+//            walked out of the office stops being useful on its own
+// The 2025 hash stays valid so machines already in the field keep working.
+const DEFAULT_ACT_HASH ='edde1ab26e6486e76241544a0dbde5f7473ab18eead0f14b86ddb1917e12edc1';   // phase 1
+const LEGACY_ACT_HASH  ='223e5b261379358f4da053ab1b92bc4043450f523323a33f515e7870de20fd3b';   // pre-9.7 installs
+const PHASE2_ACT_HASH  ='e2f44c24c7b45b0f0257e4bf426ad91ee55b26891c1dfb8aa7c6ab9228777276';   // phase 2
+const IDENTITY_PASS_HASH='bad17cc5875fdd8b88b0421d01559d6a6dbf884a326abcd46c2300043f64439c';  // ticket + name lock
+const PHASE2_AFTER_MS  = 24*60*60*1000;   // one day of use
 
 // ══════════════════════════════════════════════════════════
 // AUDIT TRAIL — append-only log of every significant action
@@ -3320,7 +3333,9 @@ async function importBrandFile(file){
     if(typeof renderSettings==='function' && currentTab==='settings') renderSettings();
   }catch(e){ toast('Could not read branding file','error',4000); }
 }
-function resetBrand(){ try{localStorage.removeItem('iss8_brand');}catch(_){} location.reload(); }
+function resetBrand(){
+  if(identityLocked()){ askIdentity(()=>resetBrand()); return; }
+  try{localStorage.removeItem('iss8_brand');}catch(_){} location.reload(); }
 
 // local calendar date as YYYY-MM-DD (matches <input type=date> for range compares)
 // ── Direction ─────────────────────────────────────────────
@@ -3355,6 +3370,12 @@ function txYMD(iso){ if(!iso) return ''; const d=new Date(iso); if(isNaN(d)) ret
 function cvLogoMigrate(){
   try{
     if(cfg.logoRev===2) return;
+    // A branded install (Hillside, Primecoal, any site with a signed brand
+    // file) has already had its own logo applied by applyStoredBrand() a few
+    // hundred lines above this. Overwriting it here would put Commodities
+    // Variation's mark on somebody else's ticket — mark the migration done
+    // and leave the brand alone.
+    if(window._brand && window._brand.logo){ cfg.logoRev=2; saveCfg(); return; }
     const t=cfg.ticket||(cfg.ticket={});
     const own = t.logoCustom===true;          // set when the user uploads one
     if(!own) t.logo=CV_TICKET;
@@ -3443,22 +3464,187 @@ function toggleWB(){
   document.getElementById('wb-btn').textContent=wbOpen?'▼':'▲';
 }
 
-// ── ACTIVATION ──────────────────────────────────
-async function doActivate(){
-  const v=document.getElementById('act-input').value.trim();
-  // Compare against hashed code; default ISS2025 hash baked in
-  const target=cfg.activationCodeHash||DEFAULT_ACT_HASH;
-  const ok=await verifyHash(v.toUpperCase(),target);
-  if(ok){
-    P(K.act,true);
-    document.getElementById('ovr-act').style.display='none';
-    showLogin();
-    toast('Activated ✓ Welcome to ISS Weighbridge','success');
+// ══════════════════════════════════════════════════════════════════
+// PHASE-2 AUTHORISATION
+//
+// A day after installation the software asks for a second code. Weighing
+// is deliberately NOT blocked: a weighbridge that stops mid-shift because
+// of a licence is a weighbridge that gets ripped out. Trucks keep moving
+// and keep getting tickets; it is the office side — records, reports,
+// settings, exports, users, cloud — that waits for the code.
+//
+// Honest about what this is: the check runs on this PC, so someone who
+// can edit the program files can defeat it. It stops a copied folder
+// being useful, not a determined engineer. Binding it to the Supabase
+// backend is what makes it real, and that is a separate job.
+// ══════════════════════════════════════════════════════════════════
+function licInstalledAt(){
+  const v=cfg.licInstalledAt;
+  const t=v?new Date(v).getTime():0;
+  return isFinite(t)&&t>0?t:0;
+}
+/* Phase 2 is due once a day of use has passed and it has not been given. */
+function licPhase2Due(){
+  if(cfg.licPhase2Ok===true) return false;
+  const t0=licInstalledAt();
+  if(!t0) return false;                       // never activated — phase 1 gate has it
+  return (Date.now()-t0) >= PHASE2_AFTER_MS;
+}
+function licHoursLeft(){
+  const t0=licInstalledAt(); if(!t0) return null;
+  const ms=PHASE2_AFTER_MS-(Date.now()-t0);
+  return ms>0 ? ms : 0;
+}
+/* Everything except weighing. Kept as one list so there is a single place
+   to look when someone asks "what exactly does the lock stop?" */
+const LIC_OPEN_TABS=['weigh','manual','dashboard'];
+function licBlocks(tab){ return licPhase2Due() && LIC_OPEN_TABS.indexOf(tab)<0; }
+
+function licBannerHTML(){
+  if(!licPhase2Due()) return '';
+  return `<div style="background:#2A1F10;border:1px solid #6B5220;color:#F0C674;
+      border-radius:10px;padding:10px 12px;margin-bottom:12px;display:flex;
+      gap:10px;align-items:center;flex-wrap:wrap">
+    <div style="flex:1;min-width:200px;font-size:12px">
+      <b>Authorisation required.</b> Weighing and ticketing continue as normal.
+      Records, reports, settings and exports are locked until the second
+      authorisation code is entered.
+    </div>
+    <button class="btn btn-navy btn-sm" onclick="openPhase2()">Enter code</button>
+  </div>`;
+}
+function licLockedHTML(what){
+  return `<div class="empty" style="padding:40px 20px">
+    <div class="ico">🔒</div>
+    <p style="margin-bottom:4px"><b>${esc(what||'This section')} is locked</b></p>
+    <p style="font-size:12px;color:var(--text3);max-width:340px;margin:0 auto 14px">
+      This installation has been running for more than a day and needs its
+      second authorisation. Weighing and ticketing are unaffected.</p>
+    <button class="btn btn-navy" onclick="openPhase2()">Enter authorisation code</button>
+    <div style="font-size:11px;color:var(--text3);margin-top:10px">
+      Contact Industrial Scale Solutions · ${esc(ISS_CO.phone||'')}</div>
+  </div>`;
+}
+function openPhase2(){
+  openModal('Second Authorisation',`
+    <div style="font-size:13px;color:var(--text2);margin-bottom:12px">
+      Enter the authorisation code supplied by Industrial Scale Solutions for
+      this installation.</div>
+    <div class="field"><label>Authorisation Code</label>
+      <input id="p2-input" type="password" placeholder="••••••••" autocomplete="off"
+             autocapitalize="off" spellcheck="false"
+             onkeydown="if(event.key==='Enter')doPhase2()"/></div>
+    <div id="p2-msg" style="font-size:11px;color:#C0392B;min-height:14px;margin-top:4px"></div>
+    <button class="btn btn-navy btn-full" style="margin-top:10px" onclick="doPhase2()">Authorise</button>`);
+  setTimeout(()=>document.getElementById('p2-input')?.focus(),80);
+}
+async function doPhase2(){
+  const el=document.getElementById('p2-input');
+  const msg=document.getElementById('p2-msg');
+  const v=(el?.value||'').trim();
+  if(!v){ if(msg) msg.textContent='Enter the code'; return; }
+  const h=await hashStr(v.toUpperCase());
+  if(h===(cfg.phase2CodeHash||PHASE2_ACT_HASH) || h===PHASE2_ACT_HASH){
+    cfg.licPhase2Ok=true; cfg.licPhase2At=nowISO(); saveCfg();
+    try{ pushAllToDisk(); }catch(e){}
+    try{ auditLog('edit','system','','Phase-2 authorisation accepted'); }catch(e){}
+    closeModal();
+    toast('Authorised ✓ Full access restored','success',5000);
+    render();
   }else{
-    toast('Incorrect activation code','error');
-    document.getElementById('act-input').select();
+    if(msg) msg.textContent='Incorrect authorisation code';
+    if(el){ el.value=''; el.focus(); }
   }
 }
+
+// ══════════════════════════════════════════════════════════════════
+// IDENTITY LOCK — ticket layout and the software/company name
+//
+// These are the two things that let someone rebadge this software as
+// their own. Both sit behind one code, unlocked for the session only.
+// ══════════════════════════════════════════════════════════════════
+let _identityOk=false;
+function identityLocked(){ return !_identityOk; }
+async function askIdentity(then){
+  if(_identityOk){ then&&then(); return; }
+  openModal('Protected Settings',`
+    <div style="font-size:13px;color:var(--text2);margin-bottom:12px">
+      The ticket layout and the software and company naming are protected.
+      Enter the maintenance code to unlock them for this session.</div>
+    <div class="field"><label>Maintenance Code</label>
+      <input id="idp-input" type="password" placeholder="••••" autocomplete="off"
+             inputmode="numeric" onkeydown="if(event.key==='Enter')doIdentity()"/></div>
+    <div id="idp-msg" style="font-size:11px;color:#C0392B;min-height:14px;margin-top:4px"></div>
+    <button class="btn btn-navy btn-full" style="margin-top:10px" onclick="doIdentity()">Unlock</button>`);
+  _identityThen=then||null;
+  setTimeout(()=>document.getElementById('idp-input')?.focus(),80);
+}
+let _identityThen=null;
+async function doIdentity(){
+  const el=document.getElementById('idp-input');
+  const msg=document.getElementById('idp-msg');
+  const v=(el?.value||'').trim();
+  const h=await hashStr(v);
+  if(h===(cfg.identityPassHash||IDENTITY_PASS_HASH) || h===IDENTITY_PASS_HASH){
+    _identityOk=true;
+    try{ auditLog('edit','system','','Protected settings unlocked'); }catch(e){}
+    closeModal();
+    toast('Unlocked for this session','success');
+    const f=_identityThen; _identityThen=null;
+    if(f) f(); else render();
+  }else{
+    if(msg) msg.textContent='Incorrect code';
+    if(el){ el.value=''; el.focus(); }
+  }
+}
+/* Wrap a settings panel so it cannot be edited until unlocked. */
+function identityShield(title){
+  return `<div class="card" style="border-left:4px solid #D9B45B">
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <div style="flex:1;min-width:200px">
+        <div style="font-weight:800;font-size:14px">🔒 ${esc(title)}</div>
+        <div style="font-size:12px;color:var(--text2);margin-top:3px">
+          Protected. Unlock with the maintenance code to make changes.</div>
+      </div>
+      <button class="btn btn-navy btn-sm" onclick="askIdentity(()=>render())">Unlock</button>
+    </div></div>`;
+}
+
+// ── ACTIVATION ──────────────────────────────────
+async function doActivate(){
+  const el=document.getElementById('act-input');
+  const v=(el.value||'').trim();
+  const msg=document.getElementById('act-fail');
+  if(!v){ if(msg) msg.textContent='Enter the installation code'; return; }
+  // A site that set its own code keeps it; otherwise phase 1, and the
+  // pre-9.7 code stays valid so machines in the field are not stranded.
+  const h=await hashStr(v.toUpperCase());
+  const ok = h===(cfg.activationCodeHash||DEFAULT_ACT_HASH)
+          || h===DEFAULT_ACT_HASH || h===LEGACY_ACT_HASH;
+  if(ok){
+    P(K.act,true);
+    // The phase-2 clock starts here, and is written to the disk mirror as
+    // well — clearing localStorage must not hand out another free day.
+    if(!cfg.licInstalledAt){ cfg.licInstalledAt=nowISO(); saveCfg(); try{pushAllToDisk();}catch(e){} }
+    if(msg) msg.textContent='';
+    el.value='';
+    document.getElementById('ovr-act').style.display='none';
+    showLogin();
+    toast('Installed ✓ Welcome to ISS Weighbridge','success');
+  }else{
+    _licFails=(_licFails||0)+1;
+    if(msg) msg.textContent='Incorrect installation code';
+    el.value=''; el.focus();
+    // slow a guesser down without ever locking JP out of his own install
+    if(_licFails>=3){
+      el.disabled=true;
+      if(msg) msg.textContent='Too many attempts — wait 10 seconds';
+      setTimeout(()=>{ el.disabled=false; el.focus(); if(msg) msg.textContent=''; }, 10000);
+      _licFails=0;
+    }
+  }
+}
+let _licFails=0;
 
 // ── AUTH / LOGIN ────────────────────────────────
 function showLogin(){
@@ -6745,6 +6931,7 @@ function buildTabs(){
   bar.innerHTML=TABS.filter(t=>tabAllowed(t)).map(t=>
     `<button class="tab${t.id===currentTab?' on':''}" onclick="renderTab('${t.id}')">${t.lbl}</button>`).join('');
 }
+function render(){ try{ renderTab(currentTab); }catch(e){} }
 function renderTab(id){
   const t=TABS.find(x=>x.id===id);
   if(t&&!tabAllowed(t)){ if(!requireRole(TAB_MIN_ROLE[t.id]||'master')) return; }
@@ -6757,6 +6944,11 @@ function renderTab(id){
   }
   currentTab=id; buildTabs();
   const el=document.getElementById('content'); el.innerHTML='';
+  // Phase-2 lock. Weighing is never blocked — see licBlocks().
+  if(licBlocks(id)){
+    const nm=t?String(t.lbl).replace(/<[^>]*>/g,'').trim():'This section';
+    el.innerHTML=licBannerHTML()+licLockedHTML(nm); return; }
+  if(licPhase2Due()) el.insertAdjacentHTML('beforeend',licBannerHTML());
   ({dashboard:renderDash,weigh:renderWeigh,manual:renderManual,orders:renderOrdersTab,fleet:renderFleet,database:renderDatabase,records:renderRecords,reports:renderReports,users:renderUsers,audit:renderAudit,cloud:renderCloud,settings:renderSettings})[id]?.();
 }
 let _manualUnlocked=false;
@@ -8592,11 +8784,308 @@ const ISS_BOOTSTRAP_SQL = "-- \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u
 let _cloudTok=null, _cloudBusy=false, _cloudStatus=null, _cloudMsg='', _cloudMsgKind='';
 
 function cloudCfg(){ if(!cfg.cloud) cfg.cloud={url:'',key:'',email:'',pass:'',enabled:false}; return cfg.cloud; }
-function cloudSet(k,v){ cloudCfg()[k]=(typeof v==='string'?v.trim():v); saveCfg(); }
+/* A weighbridge PC gets the PUBLISHABLE key and nothing else. The Cloud Sync
+   desktop app is the one that holds a service key, and the two must never be
+   confused: a service_role key ignores every row-level rule, so one pasted
+   here would let this PC read and rewrite every site's tickets. The warning
+   under the field was advice; this is the guard. */
+function cloudKeyIsSecret(v){
+  const x=String(v||'').trim();
+  if(/^sb_secret/i.test(x)) return true;
+  if(/^service_role/i.test(x)) return true;
+  const parts=x.split('.');                       // legacy JWT-style keys
+  if(parts.length===3){
+    try{
+      const b=parts[1].replace(/-/g,'+').replace(/_/g,'/');
+      const j=JSON.parse(atob(b+'==='.slice((b.length+3)%4)));
+      if(String(j.role||'').toLowerCase()==='service_role') return true;
+    }catch(e){}
+  }
+  return false;
+}
+function cloudSet(k,v){
+  if(k==='key' && cloudKeyIsSecret(v)){
+    toast('That is a SECRET key — it bypasses every access rule. This PC takes the publishable key only.','error',9000);
+    renderCloud();
+    return;
+  }
+  cloudCfg()[k]=(typeof v==='string'?v.trim():v); saveCfg();
+}
 function cloudUrl(){ return (cloudCfg().url||'').replace(/\/+$/,''); }
 function cloudSay(msg,kind){ _cloudMsg=msg; _cloudMsgKind=kind||''; renderCloud(); }
 
 /* Sign in with the site (or admin) account and keep the access token. */
+// ══════════════════════════════════════════════════════════════════════════
+// FLEET + ORDER CLOUD SYNC
+//
+// WHERE THIS RUNS: on ONE weighbridge PC, ticked as the sync host in the
+// Cloud tab. Not on the dashboard, not on a server, not on both bridges.
+//
+// Why one PC: two bridges sharing a folder both hold the same fleet list.
+// If both pulled and pushed, each would keep re-writing the other's rows
+// through the share and the folder would never go quiet — the same fight
+// that produced Syncthing conflict files before _pushIfChanged. So one PC
+// talks to Supabase; the share carries it to the other bridge, exactly as
+// it already carries tickets.
+//
+// Direction: two-way. The client adds trucks on their phone; the clerk adds
+// them at the bridge. Last write wins on updated_at, and a removal travels
+// as deleted=true rather than a row that silently vanishes.
+//
+// Needs 06_fleet_orders_remote_write.sql. Without it a site login can read
+// this table but not write, and the push half returns 403.
+// ══════════════════════════════════════════════════════════════════════════
+function syncCfg(){
+  const c=cloudCfg();
+  if(!c.sync) c.sync={on:false,host:'',everyMin:5,fleetCursor:'',orderCursor:'',lastAt:'',lastMsg:''};
+  return c.sync;
+}
+function syncSet(k,v){ syncCfg()[k]=v; saveCfg(); }
+/* A stable-ish id for this PC, so "the sync host" survives a restart. */
+function syncThisPC(){
+  let id=cfg.deviceId;
+  if(!id){ id='pc'+Math.random().toString(36).slice(2,10); cfg.deviceId=id; saveCfg(); }
+  return id;
+}
+function syncIsHost(){ return syncCfg().host===syncThisPC(); }
+function syncClaimHost(on){
+  syncSet('host', on?syncThisPC():'');
+  if(on) syncSet('on',true);
+  renderCloud();
+}
+
+/* PostgREST helpers that reuse the Cloud tab's sign-in. */
+async function _sbAuthed(){
+  const c=cloudCfg();
+  if(!cloudUrl()||!c.key) throw new Error('Cloud is not configured');
+  if(!_cloudTok || _cloudTok===c.key) await cloudSignIn(c.email,c.pass);
+  return c;
+}
+async function _sbReq(path, opts){
+  const c=await _sbAuthed();
+  const go=async()=>fetch(cloudUrl()+'/rest/v1/'+path, Object.assign({},opts,{
+    headers:Object.assign({apikey:c.key,'Authorization':'Bearer '+_cloudTok,
+      'Content-Type':'application/json'}, (opts&&opts.headers)||{})}));
+  let r=await go();
+  if(r.status===401){                       // token aged out mid-shift — sign in again
+    await cloudSignIn(c.email,c.pass);
+    r=await go();
+  }
+  if(!r.ok){ let d=''; try{ d=(await r.text()).slice(0,200); }catch(e){}
+             throw new Error(r.status+(d?': '+d:'')); }
+  const txt=await r.text();
+  return txt?JSON.parse(txt):null;
+}
+
+const _regKey=r=>String(r||'').trim().toUpperCase().replace(/\s+/g,'');
+
+/* ── PULL ────────────────────────────────────────────────────────────────
+   Ask only for what changed since last time. The cursor is the newest
+   updated_at already stored, so a bridge that was off for a week catches
+   up in one call instead of re-reading the whole list every 5 minutes. */
+async function syncPullFleet(){
+  const site=siteCode();
+  const rows=await _sbReq('rpc/iss_fleet_since',{method:'POST',
+    body:JSON.stringify({p_site:site,p_since:syncCfg().fleetCursor||null})});
+  if(!Array.isArray(rows)||!rows.length) return {added:0,updated:0,removed:0};
+  let added=0,updated=0,removed=0,cursor=syncCfg().fleetCursor||'';
+  rows.forEach(r=>{
+    if(r.updated_at>cursor) cursor=r.updated_at;
+    const key=_regKey(r.reg);
+    let i=fleet.findIndex(f=>f._cid===r.id);
+    if(i<0) i=fleet.findIndex(f=>_regKey(f.reg)===key);
+    if(r.deleted){
+      if(i>=0){ fleet.splice(i,1); removed++; }
+      return;
+    }
+    const rec={reg:String(r.reg||'').trim(), trailer1:r.trailer1||'', trailer2:r.trailer2||'',
+               driver:r.driver||'', transporter:r.transporter||'',
+               tare:(r.tare===null||r.tare===undefined)?'':Number(r.tare)};
+    if(i>=0){
+      const f=fleet[i];
+      // Last write wins. A local edit made AFTER the cloud row was written
+      // is not thrown away by a stale pull.
+      if(f._at && r.updated_at && new Date(f._at) > new Date(r.updated_at)){ f._cid=r.id; return; }
+      let ch=false;
+      Object.keys(rec).forEach(k=>{ if(String(f[k]||'')!==String(rec[k]||'')){ f[k]=rec[k]; ch=true; } });
+      f._cid=r.id; f._cat=r.updated_at;
+      if(ch){ f._at=r.updated_at; updated++; }
+    }else{
+      fleet.push(Object.assign({id:r.local_id||('fl'+Date.now().toString(36)+Math.random().toString(36).slice(2,5)),
+        _cid:r.id,_cat:r.updated_at,_at:r.updated_at}, rec));
+      added++;
+    }
+  });
+  syncSet('fleetCursor',cursor);
+  if(added||updated||removed) saveFleet();
+  return {added,updated,removed};
+}
+async function syncPullOrders(){
+  const site=siteCode();
+  const rows=await _sbReq('rpc/iss_orders_since',{method:'POST',
+    body:JSON.stringify({p_site:site,p_since:syncCfg().orderCursor||null})});
+  if(!Array.isArray(rows)||!rows.length) return {added:0,updated:0,removed:0};
+  let added=0,updated=0,removed=0,cursor=syncCfg().orderCursor||'';
+  rows.forEach(r=>{
+    if(r.updated_at>cursor) cursor=r.updated_at;
+    let i=orders.findIndex(o=>o._cid===r.id);
+    if(i<0) i=orders.findIndex(o=>String(o.no)===String(r.order_no));
+    if(r.deleted){ if(i>=0){ orders.splice(i,1); removed++; } return; }
+    const rec={no:r.order_no, customer:r.customer||'', product:r.product||'',
+               supplier:r.supplier||'', destination:r.destination||'',
+               transporter:r.transporter||'',
+               targetKg:r.tons_target?Math.round(Number(r.tons_target)*1000):null,
+               fleet:Array.isArray(r.fleet_regs)?r.fleet_regs:[]};
+    if(i>=0){
+      const o=orders[i];
+      if(o._at && r.updated_at && new Date(o._at) > new Date(r.updated_at)){ o._cid=r.id; return; }
+      // loadedKg is the site's own tally and is never overwritten from the office
+      Object.keys(rec).forEach(k=>{ o[k]=rec[k]; });
+      o.active=r.active!==false; o._cid=r.id; o._cat=r.updated_at; o._at=r.updated_at;
+      updated++;
+    }else{
+      orders.unshift(Object.assign({id:r.local_id||('O'+Date.now()+Math.floor(Math.random()*99)),
+        created:r.created_at||nowISO(),_cid:r.id,_cat:r.updated_at,_at:r.updated_at,
+        rate:null,active:r.active!==false}, rec));
+      added++;
+    }
+  });
+  syncSet('orderCursor',cursor);
+  if(added||updated||removed) saveOrders();
+  return {added,updated,removed};
+}
+
+/* ── PUSH ────────────────────────────────────────────────────────────────
+   Only records changed since they were last sent. Upsert on (site, reg) so
+   a truck the clerk added and the client also added becomes one row. */
+async function syncPushFleet(){
+  const site=siteCode();
+  const due=fleet.filter(f=>f.reg && (!f._cat || (f._at && new Date(f._at)>new Date(f._cat))));
+  if(!due.length) return 0;
+  const body=due.map(f=>({site, reg:String(f.reg).trim(), local_id:f.id,
+    trailer1:f.trailer1||null, trailer2:f.trailer2||null, driver:f.driver||null,
+    transporter:f.transporter||null,
+    tare:(f.tare===''||f.tare==null)?null:Number(f.tare), active:true, deleted:false}));
+  for(let i=0;i<body.length;i+=100){
+    await _sbReq('fleet?on_conflict=site,reg',{method:'POST',
+      headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
+      body:JSON.stringify(body.slice(i,i+100))});
+  }
+  const at=nowISO();
+  due.forEach(f=>{ f._cat=at; });
+  saveFleet();
+  return due.length;
+}
+async function syncPushOrders(){
+  const site=siteCode();
+  const due=orders.filter(o=>o.no && (!o._cat || (o._at && new Date(o._at)>new Date(o._cat))));
+  if(!due.length) return 0;
+  const body=due.map(o=>({site, order_no:String(o.no), local_id:o.id,
+    customer:o.customer||null, product:o.product||null, supplier:o.supplier||null,
+    destination:o.destination||null, transporter:o.transporter||null,
+    tons_target:o.targetKg?Number(o.targetKg)/1000:null,
+    fleet_regs:Array.isArray(o.fleet)&&o.fleet.length?o.fleet:null,
+    active:o.active!==false, deleted:false}));
+  for(let i=0;i<body.length;i+=100){
+    await _sbReq('orders?on_conflict=site,order_no',{method:'POST',
+      headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
+      body:JSON.stringify(body.slice(i,i+100))});
+  }
+  const at=nowISO();
+  due.forEach(o=>{ o._cat=at; });
+  saveOrders();
+  return due.length;
+}
+
+let _syncBusy=false;
+async function syncRun(manual){
+  if(_syncBusy) return;
+  if(!manual){
+    if(!syncCfg().on || !syncIsHost()) return;      // only the host PC, only when on
+    if(!cloudUrl()||!cloudCfg().key||!cloudCfg().email) return;
+  }
+  _syncBusy=true;
+  if(manual) renderCloud();
+  try{
+    // Pull first: the cloud is where the client's additions live, and pushing
+    // first would send a stale local copy over a newer remote row.
+    const f=await syncPullFleet();
+    const o=await syncPullOrders();
+    const pf=await syncPushFleet();
+    const po=await syncPushOrders();
+    const bits=[];
+    if(f.added||f.updated||f.removed) bits.push(`fleet in ${f.added}+/${f.updated}~/${f.removed}-`);
+    if(o.added||o.updated||o.removed) bits.push(`orders in ${o.added}+/${o.updated}~/${o.removed}-`);
+    if(pf) bits.push(pf+' trucks up');
+    if(po) bits.push(po+' orders up');
+    syncSet('lastAt',nowISO());
+    syncSet('lastMsg', bits.length?bits.join(' · '):'up to date');
+    if(f.added||f.updated||f.removed||o.added||o.updated||o.removed){
+      if(currentTab==='fleet') renderFleet();
+      if(currentTab==='orders') renderOrdersTab();
+    }
+    if(manual) toast('Sync complete — '+(bits.join(' · ')||'nothing to do'),'success',5000);
+  }catch(e){
+    const m=String(e.message||e);
+    syncSet('lastAt',nowISO());
+    syncSet('lastMsg','failed — '+m.slice(0,120));
+    if(/403/.test(m))      syncSet('lastMsg','failed — this login may read but not write. Run 06_fleet_orders_remote_write.sql');
+    else if(/42883|does not exist|404/.test(m)) syncSet('lastMsg','failed — the tables or RPCs are missing. Run 05_orders_fleet.sql then 06_fleet_orders_remote_write.sql');
+    if(manual) toast('Sync failed: '+m.slice(0,90),'error',7000);
+  }
+  _syncBusy=false;
+  if(currentTab==='cloud') renderCloud();
+}
+function syncStart(){
+  if(_syncTimer) clearInterval(_syncTimer);
+  const mins=Math.max(1,Math.min(120,parseInt(syncCfg().everyMin)||5));
+  _syncTimer=setInterval(()=>{ syncRun(false); }, mins*60*1000);
+  setTimeout(()=>syncRun(false), 20000);          // one pass shortly after boot
+}
+let _syncTimer=null;
+function syncPanelHTML(){
+  const sc=syncCfg(), host=syncIsHost(), other=sc.host && !host;
+  return `
+  <div class="sg"><div class="sg-title">Fleet &amp; Orders sync</div>
+    <div class="card">
+      <div style="font-size:12.5px;color:var(--text3);line-height:1.6;margin-bottom:10px">
+        Pulls trucks and orders the client adds on the Remote Monitor, and pushes
+        the ones added here. <b style="color:var(--text)">Run this on one PC only</b> —
+        the shared folder carries the result to the other bridge.
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px 0">
+        <input type="checkbox" ${host?'checked':''} onchange="syncClaimHost(this.checked)"/>
+        <span><b>This PC syncs fleet &amp; orders</b>${other?' — currently claimed by another PC':''}</span>
+      </label>
+      ${host?`
+      <div class="row2" style="margin-top:6px">
+        <div class="field"><label>Every … minutes</label>
+          <input type="number" min="1" max="120" value="${esc(sc.everyMin||5)}"
+            onblur="syncSet('everyMin',parseInt(this.value)||5);syncStart()"/></div>
+        <div class="field"><label>Site</label>
+          <input value="${esc(siteCode())}" disabled/></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:4px">
+        <button class="btn btn-navy btn-sm" onclick="syncRun(true)" ${_syncBusy?'disabled':''}>
+          ${_syncBusy?'Syncing…':'⟳ Sync now'}</button>
+        <button class="btn btn-ghost btn-sm" onclick="syncResetCursor()">Re-read everything</button>
+      </div>
+      ${sc.lastAt?`<div style="margin-top:10px;font-size:12px;color:${/failed/.test(sc.lastMsg||'')?'#FF7A6B':'var(--text3)'}">
+        Last run ${esc(fmtDT(sc.lastAt))} — ${esc(sc.lastMsg||'')}</div>`:''}
+      `:`<div style="font-size:12px;color:var(--text3);margin-top:6px">
+        Tick the box on whichever PC should do the talking. The other bridge gets
+        everything through the shared folder.</div>`}
+    </div>
+  </div>`;
+}
+function syncResetCursor(){
+  syncSet('fleetCursor',''); syncSet('orderCursor','');
+  fleet.forEach(f=>{ delete f._cat; }); orders.forEach(o=>{ delete o._cat; });
+  saveFleet(); saveOrders();
+  toast('Cursor cleared — the next sync re-reads the whole list','success');
+  syncRun(true);
+}
+
 async function cloudSignIn(email, pass){
   const c=cloudCfg();
   if(!cloudUrl()||!c.key) throw new Error('Enter the project URL and publishable key first');
@@ -8771,6 +9260,8 @@ function renderCloud(){
     </div>
   </div>
 
+  ${syncPanelHTML()}
+
   <div class="sg"><div class="sg-title">Backend setup — once per Supabase project</div>
     <div class="card">
       <div style="font-size:12.5px;color:var(--text3);line-height:1.6;margin-bottom:10px">
@@ -8842,11 +9333,14 @@ function renderSettings(){ setTimeout(refreshShareStat,120); setTimeout(()=>{ if
         Fix: rebuild so the serial driver matches this app — <span style="font-family:monospace">npm install</span> then <span style="font-family:monospace">npm run dist</span> (or <span style="font-family:monospace">npx electron-rebuild -f -w serialport</span>). Full detail under <b>Help → Serial Diagnostics</b>.
       </div>
     </div>` : ''}
-    <div class="sg"><div class="sg-title">Site Identity</div>
+    <div class="sg"><div class="sg-title">Site Identity
+        ${identityLocked()?`<button class="btn btn-ghost btn-sm" style="float:right"
+          onclick="askIdentity(()=>renderSettings())">🔒 Unlock naming</button>`:
+          `<span style="float:right;font-size:11px;color:#2FB170">🔓 unlocked this session</span>`}</div>
       <div class="card">
         <div class="row2">
-          <div class="field"><label>Company Name</label><input id="s-co" value="${esc(cfg.companyName||'')}" placeholder="${ISS.name}" onblur="setSave('companyName',this.value);applyBranding()"/></div>
-          <div class="field"><label>Site Name</label><input id="s-site" value="${esc(cfg.siteName||'')}" placeholder="Woestaleen Colliery" onblur="setSave('siteName',this.value)"/></div>
+          <div class="field"><label>Company Name</label><input id="s-co" ${identityLocked()?'disabled':''} value="${esc(cfg.companyName||'')}" placeholder="${ISS.name}" onblur="setSave('companyName',this.value);applyBranding()"/></div>
+          <div class="field"><label>Site Name</label><input id="s-site" ${identityLocked()?'disabled':''} value="${esc(cfg.siteName||'')}" placeholder="Woestaleen Colliery" onblur="setSave('siteName',this.value)"/></div>
           <div class="field"><label>Site Code</label>
             <input id="s-sitecode" value="${esc(cfg.siteCode||'')}" placeholder="hillside"
               onblur="setSave('siteCode',this.value.trim().toLowerCase().replace(/[^a-z0-9-]+/g,'-').replace(/^-|-$/g,''));renderSettings()"/>
@@ -9422,6 +9916,8 @@ function renderBridgePills(){
 }
 function switchBridge(i){activeBridge=i;renderBridgePills();updateWeight(bState[i].live);setPill(bState[i].state==='connected'?'● Live':'○ Waiting for scale','','',i);renderTab(currentTab);}
 function openTicketBuilder(){
+  // The ticket is what carries ISS's and the client's identity onto paper.
+  if(identityLocked()){ askIdentity(()=>openTicketBuilder()); return; }
   if(!cfg.ticket) cfg.ticket=JSON.parse(JSON.stringify(DEF_CFG.ticket));
   openModal('🎨 Ticket Designer', ticketBuilderHTML());
   setTimeout(refreshTicketPreview,50);
@@ -10213,7 +10709,17 @@ async function manualSaveAll(){
   // ticking whether or not anyone is signed in — an unattended night shift
   // still gets its 06:00 report out.
   try{ cvLogoMigrate(); }catch(e){}
+  // Re-check the licence every 10 minutes: a bridge left running for days
+  // must still reach phase 2 without needing a restart.
+  try{
+    let _wasDue=licPhase2Due();
+    setInterval(()=>{
+      const due=licPhase2Due();
+      if(due!==_wasDue){ _wasDue=due; try{ renderTab(currentTab); }catch(e){} }
+    }, 10*60*1000);
+  }catch(e){}
   try{ repStart(); }catch(e){ try{Debug.log('reports: '+e.message);}catch(_){} }
+  try{ syncStart(); }catch(e){ try{Debug.log('fleet sync: '+e.message);}catch(_){} }
   showLogin();
 })();
 

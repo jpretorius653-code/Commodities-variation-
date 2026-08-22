@@ -15,6 +15,62 @@
 
 begin;
 
+-- ── the two helpers this migration leans on ────────────────────────
+-- 03_site_auth_rls.sql and 03b create iss_may_use_site() and
+-- iss_is_admin(). If those were never run on THIS project, every policy
+-- below fails with 42883. Created here only when absent, so a project
+-- that already has them keeps its own working versions untouched.
+do $mig$
+begin
+  if not exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname='public' and p.proname='iss_is_admin'
+  ) then
+    execute $fn$
+      create function public.iss_is_admin()
+      returns boolean language sql stable security definer
+      set search_path = public as $body$
+        select coalesce((select us.is_admin from public.user_sites us
+                          where us.user_id = auth.uid()
+                            and coalesce(us.is_admin,false) limit 1), false);
+      $body$;
+    $fn$;
+    execute 'grant execute on function public.iss_is_admin() to authenticated';
+    raise notice 'created public.iss_is_admin()';
+  end if;
+
+  if not exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname='public' and p.proname='iss_may_use_site'
+  ) then
+    execute $fn$
+      create function public.iss_may_use_site(p_site text)
+      returns boolean language sql stable security definer
+      set search_path = public as $body$
+        select public.iss_is_admin() or exists (
+          select 1 from public.user_sites us
+           where us.user_id = auth.uid() and us.site = p_site);
+      $body$;
+    $fn$;
+    execute 'grant execute on function public.iss_may_use_site(text) to authenticated';
+    raise notice 'created public.iss_may_use_site(text)';
+  end if;
+end
+$mig$;
+
+-- Both helpers read public.user_sites (user_id / site / is_admin). If that
+-- table does not exist either, stop here and run 03_site_auth_rls.sql and
+-- 03b_site_auth_rls_admin.sql first — this migration cannot invent your
+-- access model for you.
+do $chk$
+begin
+  if not exists (select 1 from information_schema.tables
+                  where table_schema='public' and table_name='user_sites') then
+    raise exception 'public.user_sites is missing — run 03_site_auth_rls.sql and 03b first';
+  end if;
+end
+$chk$;
+
 -- ── the tables may not exist yet if 05 was never run ────────────────
 create table if not exists public.fleet (
   id          uuid primary key default gen_random_uuid(),

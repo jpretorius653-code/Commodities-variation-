@@ -1,5 +1,72 @@
 # Build notes
 
+## 9.7.3 — the weighbridge PC cannot hold a secret key
+The Cloud Sync desktop app holds a service key; a weighbridge PC gets the
+publishable key and nothing else. The two must never be confused — a
+service_role key ignores every row-level rule, so one pasted into a site PC
+would let it read and rewrite every other site's tickets. The note under the
+field was advice; the field now refuses a secret key outright, including the
+legacy JWT form (decoded and checked for role=service_role).
+
+## 9.7.2 — brand-safety fix before any rebuild
+`cvLogoMigrate()` (added in 9.6.8) overwrote `cfg.ticket.logo` on any install
+that had not explicitly uploaded its own logo. `applyStoredBrand()` runs
+EARLIER in boot, so on a site running a signed brand file the migration was
+clobbering that site's logo with the Commodities Variation mark. It now
+detects an applied brand, marks itself done and leaves the logo alone.
+
+This mattered only if a branded package (Hillside, Primecoal) were built from
+this codebase. Fixed regardless — it was a live footgun.
+
+## What changed in 9.7.1 — fleet & orders sync (Cloud tab)
+**Where it runs:** on ONE weighbridge PC, ticked as the sync host under
+Cloud → Fleet & Orders sync. Not on the dashboard, not on a server, not on
+both bridges. The shared folder carries the result to the second bridge,
+exactly as it already carries tickets. Two PCs both pulling and pushing would
+re-write each other's rows through the share and the folder would never go
+quiet — the same fight that produced Syncthing conflict files.
+
+* Two-way. Pull first (the client's phone additions are the newer truth),
+  then push what was added at the bridge.
+* Delta only — `iss_fleet_since` / `iss_orders_since` with a stored cursor, so
+  a bridge that was off for a week catches up in one call.
+* Last write wins on `updated_at`; a local edit made after the cloud row is
+  not thrown away by a stale pull, and is queued back up instead.
+* Removals travel as `deleted = true`.
+* Upsert on (site, reg) and (site, order_no), so a truck added on both sides
+  becomes one row rather than a duplicate.
+* An order's `loadedKg` is the site's own tally and is never overwritten.
+* Re-signs in automatically when the token ages out mid-shift.
+* Failure messages name the fix: a 403 says to run
+  `06_fleet_orders_remote_write.sql`; a missing function says to run 05 then 06.
+* "Re-read everything" clears the cursor when you want a full resync.
+
+## What changed in 9.7.0 — installation licence and identity lock
+* **Installation code is masked** (`type=password`) and no longer shows a hint
+  in the placeholder. Three wrong tries pause the field for 10 seconds.
+* **Phase 1** is the installation code, entered once per PC. The pre-9.7 code
+  stays valid so machines already in the field are not stranded.
+* **Phase 2** — one day after installation the software asks for a second
+  authorisation code. **Weighing, manual weigh, the dashboard and ticket
+  printing are deliberately NOT blocked**: a weighbridge that stops mid-shift
+  over a licence is a weighbridge that gets ripped out. Records, reports,
+  orders, fleet, database, users, audit, cloud and settings wait for the code.
+  Re-checked every 10 minutes, so a bridge left running for days reaches it
+  without a restart.
+* The install timestamp is written to the disk mirror as well as localStorage,
+  so clearing browser storage does not hand out another free day.
+* **Identity lock.** The Ticket Designer, the Company/Site naming fields and
+  the branding reset all sit behind one maintenance code, unlocked for the
+  session only. These are the three ways this software could be rebadged as
+  somebody else's.
+* All four codes are stored as salted SHA-256 — no plaintext in the file.
+
+**What this is and is not.** The check runs on the PC, so anyone who can edit
+the program files can defeat it. It stops a copied installation folder from
+being useful; it does not stop a determined engineer. Real enforcement means
+the code being validated against Supabase and bound to a machine ID — the
+backend for that now exists, and it is a separate job.
+
 ## What changed in 9.6.9 — the fleet list becomes a haulier register
 The fleet record already carried a Transporter, and the template already had
 the column. What was missing was the view: the yard thinks in hauliers, not in
