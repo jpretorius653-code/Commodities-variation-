@@ -47,4 +47,9 @@ contextBridge.exposeInMainWorld('issDesktop', {
   sharedStatus:   () => ipcRenderer.invoke('iss-shared-status'),
   pickSyncFolder: () => ipcRenderer.invoke('iss-pick-sync-folder'),
   openBackupFolder: () => ipcRenderer.invoke('iss-open-backup-folder'),
+
+  // ---- automatic reporting ----
+  sendMail:      (opts) => ipcRenderer.invoke('iss-mail-send', opts),
+  httpPost:      (req)  => ipcRenderer.invoke('iss-http-post', req),
+  openExternal:  (url)  => ipcRenderer.invoke('iss-open-external', url),
 });

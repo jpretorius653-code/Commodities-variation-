@@ -7,6 +7,15 @@
 
 const net = require('net');
 
+function unescape(s) {
+  return String(s || '')
+    .replace(/<CR>/gi, '\r').replace(/<LF>/gi, '\n')
+    .replace(/<ENQ>/gi, '\x05').replace(/<STX>/gi, '\x02')
+    .replace(/<ETX>/gi, '\x03').replace(/<EOT>/gi, '\x04')
+    .replace(/\\r/g, '\r').replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+    .replace(/\\x([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
 class TcpManager {
   constructor() {
     this.conns = {};
@@ -19,7 +28,7 @@ class TcpManager {
     bi = Number(bi);
     this.close(bi, true);          // drop any existing, keep intent
     const c = this.conns[bi] || (this.conns[bi] = {});
-    c.opts = Object.assign({ host: '', port: 8899 }, opts);
+    c.opts = Object.assign({ host: '', port: 8899, pollCmd: '', pollMs: 1000 }, opts);
     c.want = true;
     c.attempts = 0;
     this._spawn(bi);
@@ -46,7 +55,24 @@ class TcpManager {
     // guard the initial connect so a black-hole IP doesn't hang forever
     sock.setTimeout(8000, () => { if (!c._connected) { try { sock.destroy(); } catch (_) {} } });
 
-    sock.on('connect', () => { c._connected = true; sock.setTimeout(0); });
+    sock.on('connect', () => {
+      c._connected = true; sock.setTimeout(0);
+      // Demand-mode polling over the network, same tokens as the USB path —
+      // an IP-to-serial gateway is transparent, so a 920i behind one still
+      // needs KPRINT/XG sent to it before it will answer.
+      clearInterval(c.pollTimer);
+      const raw = String(c.opts.pollCmd || '');
+      if (raw) {
+        const cmd = Buffer.from(unescape(raw), 'latin1');
+        c.pollTimer = setInterval(() => {
+          if (c.sock !== sock || sock.destroyed || !c._connected) { clearInterval(c.pollTimer); return; }
+          // Callback form: a write that fails after the socket drops must not
+          // surface as an uncaught exception in the main process.
+          try { sock.write(cmd, (err) => { if (err) console.warn('[tcp] bridge' + bi + ' poll write failed: ' + err.message); }); }
+          catch (e) { console.warn('[tcp] bridge' + bi + ' poll write threw: ' + (e && e.message)); }
+        }, Math.max(150, parseInt(c.opts.pollMs) || 1000));
+      }
+    });
     sock.on('data', (buf) => {
       // forward raw bytes into the same pipeline as native serial
       this.send('iss-serial-raw', { bi, data: buf.toString('latin1') });
@@ -54,6 +80,7 @@ class TcpManager {
     sock.on('error', (e) => { this._status(bi, 'error', `${host}:${port}`, e.message); });
     sock.on('close', () => {
       c._connected = false;
+      try { clearInterval(c.pollTimer); } catch (_) {}
       this._cleanup(c);
       this._status(bi, 'closed', `${host}:${port}`);
       if (c.want) this._reconnect(bi);

@@ -8,6 +8,7 @@ const { SerialManager } = require('./serial');
 const { TcpManager } = require('./tcp');
 let tcp = new TcpManager();
 const { Storage } = require('./storage');
+const mailer = require('./mailer');
 
 const isDev = !app.isPackaged;
 let win = null;
@@ -295,6 +296,28 @@ function wireIpc() {
     return storage.setSyncFolder(r.filePaths[0]);
   });
   ipcMain.handle('iss-open-backup-folder', () => shell.openPath(storage.backupDir));
+
+  // ---- Automatic reporting: e-mail + outbound HTTPS ----
+  // Both live in the main process because the renderer is on file://: it has
+  // no sockets for SMTP, and Meta's Graph API sends no CORS headers so a
+  // fetch() from the page never leaves the machine.
+  ipcMain.handle('iss-mail-send', async (_e, opts) => {
+    try { return await mailer.sendMail(opts || {}); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('iss-http-post', async (_e, req) => {
+    try { return await mailer.httpPost(req || {}); }
+    catch (e) { return { ok: false, error: e.message }; }
+  });
+  // Click-to-send WhatsApp (wa.me) and any other external link.
+  ipcMain.handle('iss-open-external', async (_e, url) => {
+    try {
+      const u = new URL(String(url));
+      if (!/^https?:$/.test(u.protocol)) return { ok: false, error: 'blocked' };
+      await shell.openExternal(u.href);
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
 }
 
 // ---- persist paired ports so they auto-reopen on next launch ----
