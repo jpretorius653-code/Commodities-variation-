@@ -2645,7 +2645,7 @@ var qrcode = function() {
 // Format is deliberate: no spaces around '=', single quotes, one line —
 // the workflow greps for it.
 // ══════════════════════════════════════════════════════════
-const RENDERER_BUILD='9.7.3';
+const RENDERER_BUILD='9.8.1';
 window.RENDERER_BUILD=RENDERER_BUILD;
 // ══════════════════════════════════════════════════════════
 // DEBUG CONSOLE — permanent, toggleable diagnostic panel.
@@ -5379,6 +5379,7 @@ function mergeRemoteTx(txData, fromBox){
     // If it was pending on our side, remove from pending
     pending = pending.filter(p => p.vehicleReg !== rt.vehicleReg);
     saveTxs(); savePend();
+    try{ syncTicketNow(); }catch(e){}
     updateWBCount();
     toast('🔄 Synced from Box '+(fromBox||'?')+': '+rt.vehicleReg+' — '+fmt(rt.net||0)+' kg','info');
     if(currentTab==='dashboard') renderDash();
@@ -5480,7 +5481,9 @@ function updateWeight(w){
   document.getElementById('wb-live').textContent=Math.round(w);
   const over=cfg.grossMax>0&&w>cfg.grossMax;
   document.getElementById('hdr-wt').classList.toggle('over',over);
-  setMotion(computeMotion(Math.round(w)));
+  const st=computeMotion(Math.round(w));
+  setMotion(st);
+  try{ lwTick(Math.round(w), st); }catch(e){}     // publish to the cloud, if enabled
 }
 
 // ── WEIGHING ────────────────────────────────────
@@ -5725,6 +5728,7 @@ function completeTx(printType){
   activeTx.id=txId(); activeTx.completedAt=nowISO();
   stampTx(activeTx);
   txs.unshift({...activeTx}); saveTxs(); syncTxToBox(txs[0]); autoBackup('tx');
+  try{ syncTicketNow(); }catch(e){}
   _editUnlocked=false;
   auditLog('complete','tx',activeTx.id,activeTx.vehicleReg+' NET '+activeTx.net+'kg ('+activeTx.product+')');
   checkOrderCompletion(activeTx.orderId);   // deactivate order once tonnage reached
@@ -8270,6 +8274,7 @@ function saveManualTx(printType){
     operatorName:session?.name||''};
   stampTx(tx);
   txs.unshift(tx); saveTxs(); syncTxToBox(txs[0]); autoBackup('tx');
+  try{ syncTicketNow(); }catch(e){}
   auditLog('complete','tx',tx.id,'MANUAL '+reg+' NET '+net+'kg ('+(tx.product||'—')+')');
   checkOrderCompletion(orderId);
   toast('✓ Manual ticket saved: '+reg+' — '+fmt(net)+' '+u_(),'success',5000);
@@ -8997,6 +9002,100 @@ async function syncPushOrders(){
   return due.length;
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// TICKET PUBLISHER  —  app → cloud
+//
+// On a connected bridge the app writes tickets itself, which is what the
+// Cloud Sync desktop app does at Hillside. Same table, same columns, so the
+// dashboard needs no special case and the two can run side by side during a
+// changeover.
+//
+// TWO KINDS OF ROW
+//   status = 'open'      a truck weighed in, still on site. This is what
+//                        makes "trucks on site" work at all — a completed
+//                        ticket cannot tell you who is still in the yard.
+//   status = 'complete'  the finished ticket. THIS is the permanent record.
+//
+// An open row is replaced by the complete one on the same (site, ticket) key,
+// so nothing is duplicated and nothing is left hanging when a truck leaves.
+//
+// Ticket numbers repeat across sites, so the key is (site, ticket) — never
+// ticket alone.
+// ══════════════════════════════════════════════════════════════════════════
+function txOrderNo(t){
+  if(!t) return '';
+  if(t.orderId){ const o=orders.find(x=>x.id===t.orderId); if(o&&o.no) return String(o.no); }
+  return String(t.orderNoManual||'');
+}
+/* One local transaction as the cloud sees it. */
+function txCloudRow(t, status){
+  const dir=txDir(t);
+  return {
+    site:      siteCode(),
+    ticket:    String(t.id||''),
+    row_id:    t.rowId || undefined,
+    reg:       t.vehicleReg||'',
+    customer:  t.customer||'',
+    product:   t.product||'',
+    // 'dispatch' / 'receive'. The dashboard also accepts the older
+    // Loading / Off Loading wording that Cloud Sync sends.
+    action:    dir||'',
+    status:    status,
+    order_no:  txOrderNo(t)||null,
+    transporter: t.transporter||null,
+    driver:    t.driver||null,
+    net:       (t.net==null)?null:Number(t.net),
+    empty_weight: (status==='open')
+                    ? ((t.firstWeight==null)?null:Number(t.firstWeight))
+                    : (dir==='dispatch' ? (t.firstWeight==null?null:Number(t.firstWeight))
+                                        : (t.secondWeight==null?null:Number(t.secondWeight))),
+    time_in:   t.firstWeightTime||null,
+    time_out:  (status==='complete') ? (t.completedAt||t.secondWeightTime||null) : null
+  };
+}
+/* Called the moment a ticket completes. The 5-minute pass is a safety net,
+   not the delivery mechanism — a clerk who prints a ticket expects to see it
+   on the phone before the truck is off the bridge. */
+function syncTicketNow(){
+  if(!syncCfg().tickets || !syncIsHost()) return;
+  setTimeout(()=>{ syncPushTickets().catch(()=>{}); }, 1200);
+}
+async function syncPushTickets(){
+  const sc=syncCfg();
+  if(!sc.tickets) return 0;
+
+  // Completed tickets not yet sent, oldest first so a long backlog lands in
+  // the order it happened. Capped per pass: a bridge that was offline for a
+  // week must not try to post 900 rows in one request.
+  const doneDue = txs.filter(t=>t.completedAt && !t._txAt)
+                     .sort((a,b)=>String(a.completedAt).localeCompare(String(b.completedAt)))
+                     .slice(0,200);
+
+  // Trucks still on site: first weight taken, no second. Re-sent every pass
+  // (they are few, and the dashboard's on-site timer wants them current).
+  const openRows=(pending||[]).filter(p=>p&&p.id&&p.firstWeightTime&&!p.completedAt)
+                              .map(p=>txCloudRow(p,'open'));
+
+  let n=0;
+  if(openRows.length){
+    await _sbReq('transactions?on_conflict=site,ticket',{method:'POST',
+      headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
+      body:JSON.stringify(openRows)});
+    n+=openRows.length;
+  }
+  for(let i=0;i<doneDue.length;i+=100){
+    const batch=doneDue.slice(i,i+100);
+    await _sbReq('transactions?on_conflict=site,ticket',{method:'POST',
+      headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
+      body:JSON.stringify(batch.map(t=>txCloudRow(t,'complete')))});
+    const at=nowISO();
+    batch.forEach(t=>{ t._txAt=at; });           // marked only after it landed
+    n+=batch.length;
+  }
+  if(doneDue.length) saveTxs();
+  return n;
+}
+
 let _syncBusy=false;
 async function syncRun(manual){
   if(_syncBusy) return;
@@ -9013,11 +9112,13 @@ async function syncRun(manual){
     const o=await syncPullOrders();
     const pf=await syncPushFleet();
     const po=await syncPushOrders();
+    const pt=await syncPushTickets();
     const bits=[];
     if(f.added||f.updated||f.removed) bits.push(`fleet in ${f.added}+/${f.updated}~/${f.removed}-`);
     if(o.added||o.updated||o.removed) bits.push(`orders in ${o.added}+/${o.updated}~/${o.removed}-`);
     if(pf) bits.push(pf+' trucks up');
     if(po) bits.push(po+' orders up');
+    if(pt) bits.push(pt+' tickets up');
     syncSet('lastAt',nowISO());
     syncSet('lastMsg', bits.length?bits.join(' · '):'up to date');
     if(f.added||f.updated||f.removed||o.added||o.updated||o.removed){
@@ -9043,6 +9144,82 @@ function syncStart(){
   setTimeout(()=>syncRun(false), 20000);          // one pass shortly after boot
 }
 let _syncTimer=null;
+// ══════════════════════════════════════════════════════════════════════════
+// LIVE WEIGHT PUBLISHER
+//
+// A new bridge is its own cloud client: the PC already reads the indicator
+// over RS232 and already holds an authenticated Supabase session, so it
+// posts the live weight itself. No ESP32 gateway, no Cloud Sync.
+//
+// WHY A SEPARATE TABLE, AND WHY UPSERT
+// The live weight is throwaway — the ticket is the permanent record, exactly
+// as the belt scales keep hourly totals permanently and let raw readings age
+// out. So this writes ONE ROW PER BRIDGE and updates it in place. Nothing
+// accumulates, so nothing needs deleting, and there is no retention job to
+// forget. A bridge posting every 2 s for a year is still one row.
+//
+// CADENCE
+//   moving  — at most every 2 s, and only when the number actually changed
+//   settled — a heartbeat every 30 s, so the dashboard can tell "idle at zero"
+//             apart from "this PC died"
+// Between trucks nothing is sent at all beyond the heartbeat.
+// ══════════════════════════════════════════════════════════════════════════
+const LW_MOVING_MS = 2000;
+const LW_IDLE_MS   = 30000;
+let _lwLast = 0, _lwLastKg = null, _lwFails = 0, _lwOff = 0;
+
+function lwEnabled(){
+  const sc = syncCfg();
+  return !!(sc.live && syncIsHost() && cloudUrl() && cloudCfg().key && cloudCfg().email);
+}
+/* Called from updateWeight() on every reading. Cheap and synchronous —
+   the actual POST is fired and forgotten. */
+function lwTick(kg, stable){
+  if(!lwEnabled()) return;
+  const now = Date.now();
+  if(now < _lwOff) return;                       // backing off after failures
+  const changed = (_lwLastKg === null) || Math.abs(kg - _lwLastKg) >= 20;
+  const due = changed ? (now - _lwLast >= LW_MOVING_MS)
+                      : (now - _lwLast >= LW_IDLE_MS);
+  if(!due) return;
+  _lwLast = now; _lwLastKg = kg;
+  lwPost(kg, stable);
+}
+async function lwPost(kg, stable){
+  try{
+    await _sbReq('live_weight?on_conflict=device', {
+      method:'POST',
+      headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
+      body: JSON.stringify({
+        device: syncThisPC() + ':' + (activeBridge || 0),
+        site:   siteCode(),
+        name:   (cfg.bridges && cfg.bridges[activeBridge] && cfg.bridges[activeBridge].name)
+                  || cfg.siteName || 'Weighbridge',
+        weight: Math.round(kg),
+        stable: !!stable,
+        unit:   cfg.weightUnit || 'kg'
+      })
+    });
+    _lwFails = 0;
+  }catch(e){
+    // A weighbridge must never stop weighing because the internet is down.
+    // Back off hard and quietly; the clerk is not told, because there is
+    // nothing for the clerk to do about it.
+    _lwFails++;
+    _lwOff = Date.now() + Math.min(5*60000, 15000 * _lwFails);
+    try{ Debug.log('live weight: '+(e.message||e)); }catch(_){}
+  }
+}
+/* Clear the row on the way out, so a closed app does not leave a number on
+   the dashboard that looks live forever. */
+async function lwClear(){
+  if(!lwEnabled()) return;
+  try{
+    await _sbReq('live_weight?device=eq.'+encodeURIComponent(syncThisPC()+':'+(activeBridge||0)),
+                 {method:'DELETE'});
+  }catch(e){}
+}
+
 function syncPanelHTML(){
   const sc=syncCfg(), host=syncIsHost(), other=sc.host && !host;
   return `
@@ -9064,6 +9241,22 @@ function syncPanelHTML(){
             onblur="syncSet('everyMin',parseInt(this.value)||5);syncStart()"/></div>
         <div class="field"><label>Site</label>
           <input value="${esc(siteCode())}" disabled/></div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px 0;margin-top:4px">
+        <input type="checkbox" ${sc.live?'checked':''} onchange="syncSet('live',this.checked);renderCloud()"/>
+        <span><b>Publish live weight</b> — shows this bridge on the Remote Monitor</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px 0">
+        <input type="checkbox" ${sc.tickets?'checked':''} onchange="syncSet('tickets',this.checked);renderCloud()"/>
+        <span><b>Publish tickets</b> — trucks on site, tickets and order progress</span>
+      </label>
+      <div style="font-size:11px;color:var(--text3);margin:-2px 0 8px 26px">
+        Turn this ON only where the Cloud Sync app is NOT running, or the same
+        ticket arrives twice by two routes.
+      </div>
+      <div style="font-size:11px;color:var(--text3);margin:-2px 0 8px 26px">
+        One row per bridge, updated in place: the reading is throwaway, the ticket is the record.
+        Leave this off where a Cloud Sync app or an ESP32 gateway already reports the bridge.
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:4px">
         <button class="btn btn-navy btn-sm" onclick="syncRun(true)" ${_syncBusy?'disabled':''}>
@@ -10720,6 +10913,7 @@ async function manualSaveAll(){
   }catch(e){}
   try{ repStart(); }catch(e){ try{Debug.log('reports: '+e.message);}catch(_){} }
   try{ syncStart(); }catch(e){ try{Debug.log('fleet sync: '+e.message);}catch(_){} }
+  window.addEventListener('beforeunload', ()=>{ try{ lwClear(); }catch(e){} });
   showLogin();
 })();
 
