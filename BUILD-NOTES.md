@@ -1,5 +1,47 @@
 # Build notes
 
+## 9.8.1 — the bridge publishes its own tickets
+**Cloud → Publish tickets** (per PC, off by default). Turn it ON only where
+Cloud Sync is NOT running, or the same ticket arrives twice by two routes.
+
+* Two kinds of row. `status='open'` is a truck that weighed in and is still on
+  site — that is what makes "trucks on site" possible at all, since a finished
+  ticket cannot tell you who is still in the yard. `status='complete'` is the
+  permanent record. The open row is replaced by the complete one on the same
+  (site, ticket) key, so nothing duplicates and nothing is left hanging.
+* Keyed on **(site, ticket)** — ticket numbers repeat across sites, so ticket
+  alone would collide the moment a second bridge came online.
+* Pushed the moment a ticket completes and the moment a truck weighs in, not
+  at the next 5-minute pass. The pass is a safety net, not the delivery route.
+* A completed ticket is marked as sent only AFTER it lands, so a dropped
+  connection means a retry, never a lost ticket. Backlog capped at 200 per
+  pass so a week offline does not become one enormous request.
+* `order_no`, transporter and driver now travel with the ticket, which is what
+  order progress on the dashboard counts.
+* Needs `sql/12_tickets_from_app.sql`.
+
+## 9.8.0 — the bridge publishes its own live weight
+A connected bridge is its own cloud client. The PC already reads the indicator
+over RS232 and, since 9.7.1, holds an authenticated Supabase session — so it
+posts the live weight itself. No ESP32 gateway, no Cloud Sync.
+
+* **Cloud → Publish live weight** (per PC, off by default). Leave it off where
+  a Cloud Sync app or a gateway already reports the bridge — Hillside is
+  unaffected either way.
+* **One row per bridge, updated in place.** The reading is throwaway; the
+  ticket is the record — the same split the belt scales use between `hourly`
+  and raw `readings`. Nothing accumulates, so there is no retention job.
+  A bridge posting every 2 s for a year is still one row.
+* Cadence: at most every 2 s while the weight is actually moving, and a
+  30 s heartbeat when settled so the dashboard can tell "idle at zero" from
+  "this PC died". Sub-20 kg drift does not count as movement.
+* A failed post backs off (15 s, doubling to 5 min) and says nothing to the
+  clerk. A weighbridge must never stop weighing because the internet is down,
+  and there is nothing the clerk could do about it anyway.
+* The row is cleared on shutdown, so a closed app does not leave a number on
+  the dashboard that looks live forever.
+* Needs `sql/11_live_weight.sql`.
+
 ## 9.7.3 — the weighbridge PC cannot hold a secret key
 The Cloud Sync desktop app holds a service key; a weighbridge PC gets the
 publishable key and nothing else. The two must never be confused — a
