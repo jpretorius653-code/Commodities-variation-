@@ -88,6 +88,9 @@ function connect(opts) {
     }
     sock.once('error', reject);
     sock.setTimeout(opts.timeout || 30000, () => sock.destroy(new Error('Connection to ' + opts.host + ' timed out')));
+    // Cleared by the caller once connected — see sendMail. An idle timer left
+    // running kills the socket while it is legitimately waiting for the 250
+    // that follows a large message.
   });
 }
 
@@ -114,7 +117,8 @@ function buildMime(m) {
   if (m.replyTo) H.push('Reply-To: ' + m.replyTo);
   H.push('Subject: ' + hdrEnc(m.subject || ''));
   H.push('Date: ' + new Date().toUTCString());
-  H.push('Message-ID: <' + crypto.randomBytes(16).toString('hex') + '@iss-weighbridge>');
+  const fromDom = (String(m.from || '').split('@')[1] || 'iss-weighbridge.local').replace(/[>\s]/g, '');
+  H.push('Message-ID: <' + crypto.randomBytes(16).toString('hex') + '@' + fromDom + '>');
   H.push('MIME-Version: 1.0');
   H.push('X-Mailer: ISS Weighbridge');
 
@@ -149,7 +153,12 @@ function buildMime(m) {
     body.push(wrap76(data));
   });
   body.push('--' + mix + '--');
-  return H.join(CRLF) + CRLF + out.join(CRLF) + body.join(CRLF) + CRLF;
+  // ONE join over the whole lot. Joining `out` and `body` separately and then
+  // concatenating the two strings left the opening boundary glued to the first
+  // part header ("--ISSMIX-abcContent-Type: ..."), which is not a boundary
+  // line, so every client saw a multipart message with no parts in it: no
+  // body, no attachment.
+  return H.join(CRLF) + CRLF + out.concat(body).join(CRLF) + CRLF;
 }
 
 // ── send ───────────────────────────────────────────────────────────────────
@@ -164,22 +173,43 @@ async function sendMail(opts) {
   const to = addrList(opts.to);
   if (!to.length) return { ok: false, error: 'No recipient' };
 
+  const from = opts.from || opts.user;
+
   let sock, conn;
+  // A socket that errors or closes with nobody listening throws an uncaught
+  // exception in the main process — an LTE link dropping mid-send used to do
+  // exactly that. Route both into whichever read is waiting so the send simply
+  // fails and the outbox retries it.
+  const guard = (s) => {
+    const bail = (e) => {
+      if (conn && conn.pending) { const p = conn.pending; conn.pending = null; p.reject(e); }
+    };
+    s.on('error', (e) => bail(e instanceof Error ? e : new Error(String(e))));
+    s.on('close', () => bail(new Error('The mail server closed the connection')));
+  };
+
   try {
     sock = await connect({ host, port, secure: !!opts.secure, timeout: opts.timeout,
                            rejectUnauthorized: opts.rejectUnauthorized });
+    sock.setTimeout(0);                       // reads carry their own timeouts
     conn = new Conn(sock, log);
+    guard(sock);
     const greet = await conn.read();                       // 220, or a refusal
     if (Math.floor(greet.code / 100) !== 2) {
       // e.g. "421 service not available" from a throttled or blocked server.
       // Fail here rather than pressing on and waiting out the read timeout.
       throw new Error('SMTP ' + greet.code + ' — ' + greet.text.slice(4));
     }
-    const me = opts.clientName || 'iss-weighbridge';
+    // Some servers refuse a bare label here; use the sender's domain.
+    const me = opts.clientName || (String(from || '').split('@')[1] || '').trim() || 'iss-weighbridge.local';
     let ehlo = await conn.cmd('EHLO ' + me, [2]);
 
     if (!opts.secure && /STARTTLS/i.test(ehlo.text)) {
       await conn.cmd('STARTTLS', [2]);
+      // Detach the plaintext reader first — leaving it attached puts the raw
+      // socket in flowing mode while TLS is trying to read the handshake.
+      sock.removeAllListeners('data');
+      sock.removeAllListeners('close');
       const up = await new Promise((res, rej) => {
         const s = tls.connect({ socket: sock, servername: host,
           rejectUnauthorized: opts.rejectUnauthorized !== false }, () => res(s));
@@ -187,6 +217,8 @@ async function sendMail(opts) {
       });
       conn = new Conn(up, log);
       sock = up;
+      sock.setTimeout(0);
+      guard(sock);
       ehlo = await conn.cmd('EHLO ' + me, [2]);
     }
 
@@ -200,7 +232,6 @@ async function sendMail(opts) {
       }
     }
 
-    const from = opts.from || opts.user;
     await conn.cmd('MAIL FROM:<' + from + '>', [2]);
     for (const r of to.concat(addrList(opts.cc))) await conn.cmd('RCPT TO:<' + r + '>', [2]);
     await conn.cmd('DATA', [354]);
