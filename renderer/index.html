@@ -2645,7 +2645,7 @@ var qrcode = function() {
 // Format is deliberate: no spaces around '=', single quotes, one line —
 // the workflow greps for it.
 // ══════════════════════════════════════════════════════════
-const RENDERER_BUILD='9.8.1';
+const RENDERER_BUILD='9.9.0';
 window.RENDERER_BUILD=RENDERER_BUILD;
 // ══════════════════════════════════════════════════════════
 // DEBUG CONSOLE — permanent, toggleable diagnostic panel.
@@ -3405,7 +3405,8 @@ function saveFleet(){
 }
 // ── Order tonnage tracking ─────────────────────────
 function orderLoadedKg(orderId){
-  return txs.filter(t=>t.orderId===orderId).reduce((s,t)=>s+(t.net||0),0);
+  // A voided ticket never counts towards an order's target.
+  return txs.filter(t=>t.orderId===orderId&&!txIsVoid(t)).reduce((s,t)=>s+(t.net||0),0);
 }
 function orderRemainingKg(o){
   if(!o||!o.targetKg) return null;
@@ -5755,6 +5756,186 @@ function voidTx(){
   if(currentTab==='dashboard')renderDash();
 }
 function clearTx(){activeTx=emptyTx(); clearForm();}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  COMPLETED TICKETS — CORRECT or VOID   (Manager access + the code)
+//
+//  A weighbridge ticket is a commercial document, so nothing here deletes
+//  one. A ticket that should not have been issued is VOIDED: flagged, kept
+//  in the record, stamped VOID on any reprint, and dropped out of every
+//  total, report, export and cloud figure. A ticket with a wrong detail on
+//  it is CORRECTED, with the old value written into the audit trail.
+//
+//  Both need Manager (or Master) rank AND the override / master code, so
+//  the audit trail always names a person who could authorise it.
+// ══════════════════════════════════════════════════════════════════════════
+function txIsVoid(t){ return !!(t && t.voided); }
+function mgrGate(what,onOk){
+  if(!roleAtLeast('manager')){ toast(what+' needs Manager access','error',4500); return; }
+  passwordGate(what,onOk);
+}
+/* Save ONE record — not just the newest — and make sure both the other PC
+   and the cloud pick the change up. _ev is the edit version the share merge
+   compares; clearing _txAt puts the ticket back in the cloud push queue. */
+function txTouchRec(t){
+  t._ev=(Number(t._ev)||0)+1;
+  t._editedAt=nowISO();
+  t._txAt='';
+  saveTxs();
+  if(cfg.syncFolder){ try{ sharePut('txs',t.id,t); }catch(e){} }
+  try{ syncTicketNow(); }catch(e){}
+}
+/* A void takes tonnage back off an order. If that order had been closed on
+   target and is now short again, open it up rather than leaving it stuck. */
+function reopenOrderIfShort(orderId){
+  if(!orderId) return;
+  const o=orders.find(x=>x.id===orderId);
+  if(!o||!o.targetKg||o.active!==false) return;
+  if(orderLoadedKg(orderId)<o.targetKg){
+    o.active=true; delete o.completedAt; delete o.completedKg; saveOrders();
+    auditLog('edit','order',o.no,'Re-opened — a voided ticket put it back under target');
+    toast('Order '+o.no+' re-opened (now under target)','info',5000);
+  }
+}
+function voidTicket(id){
+  const t=txs.find(x=>x.id===id); if(!t) return;
+  if(txIsVoid(t)){ toast('Ticket '+id+' is already void','info'); return; }
+  mgrGate('Void ticket '+id,()=>{
+    const u=cfg.weightUnit||'kg';
+    openModal('⛔ Void ticket '+id,`<div style="padding:6px">
+      <div style="background:#fff5f5;border:1px solid #f0c6c6;border-radius:8px;padding:10px;font-size:13px;margin-bottom:12px">
+        <b style="font-family:monospace;letter-spacing:1px">${esc(t.vehicleReg||'')}</b> ·
+        ${esc(t.product||'—')} · <b>${fmt(t.net)} ${esc(u)}</b><br>
+        <span style="color:var(--text2)">The ticket is kept and stays in the audit trail. It is
+        flagged VOID, stamped VOID on any reprint, and drops out of every total,
+        report and export.</span>
+      </div>
+      <div class="field"><label>Reason (required)</label>
+        <input id="vd-why" placeholder="e.g. truck weighed twice / wrong customer"
+               onkeydown="if(event.key==='Enter')voidTicketGo('${id}')"/></div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-red" style="flex:1" onclick="voidTicketGo('${id}')">⛔ Void this ticket</button>
+        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      </div></div>`);
+    setTimeout(()=>document.getElementById('vd-why')?.focus(),60);
+  });
+}
+function voidTicketGo(id){
+  const t=txs.find(x=>x.id===id); if(!t) return;
+  const why=(document.getElementById('vd-why')?.value||'').trim();
+  if(!why){ toast('A reason is required','error'); return; }
+  t.voided=true; t.voidedAt=nowISO(); t.voidedBy=session?.name||''; t.voidReason=why;
+  txTouchRec(t);
+  auditLog('void','tx',t.id,'VOIDED '+t.vehicleReg+' · '+fmt(t.net)+' '+(cfg.weightUnit||'kg')+' — '+why,
+           {voided:false,net:t.net},{voided:true,net:t.net,reason:why});
+  reopenOrderIfShort(t.orderId);
+  closeModal(); autoBackup('void');
+  toast('Ticket '+id+' voided — kept on record','info',4500);
+  renderTab(currentTab);
+}
+function unvoidTicket(id){
+  const t=txs.find(x=>x.id===id); if(!t||!txIsVoid(t)) return;
+  mgrGate('Restore ticket '+id,()=>{
+    const was=t.voidReason||'';
+    delete t.voided; delete t.voidedAt; delete t.voidedBy; delete t.voidReason;
+    txTouchRec(t);
+    auditLog('edit','tx',t.id,'Void REVERSED on '+t.vehicleReg+(was?' (was voided: '+was+')':''));
+    checkOrderCompletion(t.orderId);
+    toast('Ticket '+id+' restored','success');
+    renderTab(currentTab);
+  });
+}
+// Fields a correction may touch. Weights and the batch/dispatch field are
+// handled separately because they carry arithmetic or change label by direction.
+const TXEDIT=[['vehicleReg','Vehicle reg'],['customer','Customer'],['product','Product'],
+  ['transporter','Transporter'],['supplier','Supplier'],['destination','Destination'],
+  ['driver','Driver'],['orderNoManual','Order number'],['notes','Notes']];
+function editTicket(id){
+  const t=txs.find(x=>x.id===id); if(!t) return;
+  if(txIsVoid(t)){ toast('Restore the ticket before correcting it','error',4500); return; }
+  mgrGate('Correct ticket '+id,()=>{
+    const u=cfg.weightUnit||'kg';
+    const disp=dirFieldIsDispatch(txDir(t));
+    const bdLabel=disp?'Dispatch Ticket Nr':'Batch Number';
+    const bdVal=disp?(t.dispatchTicketNo||''):(t.batchNo||'');
+    openModal('✏️ Correct ticket '+id,`<div style="padding:6px">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:12px">
+        Every change is written to the audit trail with the old value beside it.
+        Changing a weight recalculates the net. To cancel a ticket outright, use Void.
+      </div>
+      <div class="row2">
+        <div class="field"><label>1st weight (${esc(u)})</label>
+          <input id="te-w1" type="number" step="1" value="${t.firstWeight??''}" oninput="teNet()"/></div>
+        <div class="field"><label>2nd weight (${esc(u)})</label>
+          <input id="te-w2" type="number" step="1" value="${t.secondWeight??''}" oninput="teNet()"/></div>
+      </div>
+      <div style="text-align:center;margin:2px 0 12px">
+        <div style="font-size:10px;color:var(--text3);letter-spacing:2px;font-weight:700">NET</div>
+        <div id="te-net" style="font-family:monospace;font-weight:900;font-size:22px;color:var(--navy)">${fmt(t.net)} ${esc(u)}</div>
+      </div>
+      ${TXEDIT.map(([k,l])=>`<div class="field"><label>${l}</label>
+        <input id="te-${k}" value="${esc(t[k]||'')}"/></div>`).join('')}
+      <div class="field"><label>${bdLabel}</label><input id="te-bd" value="${esc(bdVal)}"/></div>
+      ${(t.custom||[]).map((c,i)=>c.id==='cfBatch'?'':`<div class="field">
+        <label>${esc(c.label||c.id)}</label><input id="te-cf${i}" value="${esc(c.value||'')}"/></div>`).join('')}
+      <div class="field"><label>Reason for the correction (required)</label>
+        <input id="te-why" placeholder="e.g. clerk captured the wrong customer"/></div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-navy" style="flex:1" onclick="saveTicketEdit('${id}')">Save correction</button>
+        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      </div></div>`);
+    setTimeout(()=>document.getElementById('te-vehicleReg')?.focus(),60);
+  });
+}
+function teNet(){
+  const el=document.getElementById('te-net'); if(!el) return;
+  const a=parseFloat(document.getElementById('te-w1')?.value),
+        b=parseFloat(document.getElementById('te-w2')?.value);
+  el.textContent=(isFinite(a)&&isFinite(b))?fmt(Math.abs(b-a))+' '+(cfg.weightUnit||'kg'):'—';
+}
+function saveTicketEdit(id){
+  const t=txs.find(x=>x.id===id); if(!t) return;
+  const why=(document.getElementById('te-why')?.value||'').trim();
+  if(!why){ toast('A reason is required','error'); return; }
+  const V=i=>String(document.getElementById(i)?.value??'');
+  const before={},after={},changes=[];
+  const note=(k,was,now)=>{ if(String(was??'')===String(now??'')) return;
+    before[k]=was; after[k]=now; changes.push(k+': "'+(was??'')+'" → "'+(now??'')+'"'); };
+  TXEDIT.forEach(([k])=>{ const v=V('te-'+k).trim(); note(k,t[k]||'',v); t[k]=v; });
+  const w1=parseFloat(V('te-w1')), w2=parseFloat(V('te-w2'));
+  if(isFinite(w1)){ note('firstWeight',t.firstWeight,w1); t.firstWeight=w1; }
+  if(isFinite(w2)){ note('secondWeight',t.secondWeight,w2); t.secondWeight=w2; }
+  if(isFinite(w1)&&isFinite(w2)){ const n=Math.abs(w2-w1); note('net',t.net,n); t.net=n; }
+  const bd=V('te-bd').trim();
+  if(dirFieldIsDispatch(txDir(t))){ note('dispatchTicketNo',t.dispatchTicketNo||'',bd); t.dispatchTicketNo=bd; }
+  else{
+    note('batchNo',t.batchNo||'',bd); t.batchNo=bd;
+    const cb=(t.custom||[]).find(c=>c&&c.id==='cfBatch'); if(cb) cb.value=bd;
+  }
+  (t.custom||[]).forEach((c,i)=>{
+    if(!c||c.id==='cfBatch') return;
+    const el=document.getElementById('te-cf'+i); if(!el) return;
+    const v=String(el.value||'').trim(); note(c.label||c.id,c.value||'',v); c.value=v;
+  });
+  if(!changes.length){ closeModal(); toast('Nothing changed','info'); return; }
+  t.editedAt=nowISO(); t.editedBy=session?.name||''; t.editReason=why;
+  t.edits=((t.edits||[]).concat([{at:t.editedAt,by:t.editedBy,why,changes}])).slice(-20);
+  txTouchRec(t);
+  auditLog('edit','tx',t.id,'Corrected '+t.vehicleReg+' — '+why+' · '+changes.join('; '),before,after);
+  checkOrderCompletion(t.orderId);
+  closeModal(); autoBackup('edit');
+  toast('Ticket '+id+' corrected ✓','success',4500);
+  renderTab(currentTab);
+}
+/* VOID stamp printed across a reprint so a voided ticket can never be passed
+   off as a live one at the gate. */
+function voidStampHTML(tx,S){
+  if(!txIsVoid(tx)) return '';
+  const line=[tx.voidReason,tx.voidedAt?fmtDT(tx.voidedAt):'',tx.voidedBy].filter(Boolean).join(' · ');
+  return `<div style="border:${S(3)}px solid #C62828;color:#C62828;border-radius:${S(8)}px;text-align:center;
+      font-weight:900;letter-spacing:${S(8)}px;font-size:${S(24)}px;padding:${S(6)}px 0;margin-bottom:${S(6)}px">VOID</div>
+    <div style="text-align:center;font-size:${S(11)}px;color:#C62828;margin-bottom:${S(10)}px">${esc(line)}</div>`;
+}
 /* Copy the current indicator reading into the manual box — handy when the
    link is intermittent rather than dead, so the clerk can sanity-check the
    number before committing it. */
@@ -6012,6 +6193,7 @@ function renderTicket(tx,forceWidth){
       <td style="padding:${S(7)}px 0;font-weight:700;font-size:${S(15)}px;text-align:right;padding-left:${S(10)}px">${esc(String(v))}</td></tr>`;
     const big=t.template==='compact'?S(30):S(38);
     return `
+      ${voidStampHTML(tx,S)}
       ${ticketLogoHTML(t.template==='compact'?S(34):S(46))}
       <div style="text-align:center;margin-top:${S(6)}px">
         <div style="font-size:${S(16)}px;font-weight:900;color:${A};letter-spacing:.5px">${esc(t.companyName||'')}</div>
@@ -6063,6 +6245,7 @@ function renderTicket(tx,forceWidth){
       <div style="font-size:${hilite?S(34):S(26)}px;font-weight:900;font-family:'Courier New',monospace;color:${A}">${val}</div>
       <div style="font-size:${S(12)}px;color:#8AA0B8;margin-top:${S(4)}px">${sub}</div></td>`;
     return `
+      ${voidStampHTML(tx,S)}
       <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:4px solid ${A};padding-bottom:${S(12)}px;margin-bottom:${S(16)}px">
         <div style="flex:1">${t.showLogo!==false?ticketLogoHTML(S(60)).replace('margin:0 auto','margin:0'):''}</div>
         <div style="text-align:right;font-size:${S(12)}px;color:#555;line-height:1.6">
@@ -6280,6 +6463,7 @@ function repStats(range,filt){
   const f=filt||{};
   const list=txs.filter(t=>{
     if(!t.completedAt) return false;
+    if(txIsVoid(t)) return false;          // voided tickets are not reported
     const d=new Date(t.completedAt);
     if(!(d>=range.from&&d<range.to)) return false;
     if(f.product&&String(t.product||'')!==f.product) return false;
@@ -6998,7 +7182,7 @@ function haulierLoads(name){
                           .map(f=>String(f.reg||'').toUpperCase().replace(/\s+/g,'')));
   let loads=0, net=0;
   txs.forEach(t=>{
-    if(!t.completedAt || new Date(t.completedAt).getTime()<since) return;
+    if(!t.completedAt || txIsVoid(t) || new Date(t.completedAt).getTime()<since) return;
     const r=String(t.vehicleReg||'').toUpperCase().replace(/\s+/g,'');
     const byReg=regs.has(r);
     const byName=name!==NO_HAULIER && String(t.transporter||'').trim()===name;
@@ -7537,7 +7721,7 @@ function delFleet(id){
 function renderDash(){
   const u=cfg.weightUnit||'kg';
   const today=new Date().toDateString();
-  const tday=txs.filter(t=>new Date(t.completedAt||0).toDateString()===today);
+  const tday=txs.filter(t=>!txIsVoid(t)&&new Date(t.completedAt||0).toDateString()===today);
   const tNet=tday.reduce((s,t)=>s+(t.net||0),0);
   const onSite=pending.length;
   const chart=buildHourChart(tday);
@@ -8298,7 +8482,7 @@ function renderOrdersTab(){
       <input type="file" id="or-file" accept="${SHEET_ACCEPT}" style="display:none" onchange="importOrderList(this)"/>
     </div>
     ${orders.length?orders.map(o=>{
-      const loaded=txs.filter(t=>t.orderId===o.id).reduce((s,t)=>s+(t.net||0),0);
+      const loaded=txs.filter(t=>t.orderId===o.id&&!txIsVoid(t)).reduce((s,t)=>s+(t.net||0),0);
       const pct=o.targetKg?Math.min(100,loaded/o.targetKg*100):0;
       const closed=o.active===false;
       return`<div class="card" style="${closed?'opacity:.6':''}">
@@ -8395,12 +8579,14 @@ function renderRecords(){
   const _caret=(document.activeElement&&document.activeElement.selectionStart)||null;
   const u=cfg.weightUnit||'kg';
   const filt=filteredTxs();
-  const tot=filt.reduce((s,t)=>s+(t.net||0),0);
-  const disp=filt.filter(t=>txDir(t)==='dispatch'), recv=filt.filter(t=>txDir(t)==='receive');
+  const live=filt.filter(t=>!txIsVoid(t));      // totals never include a void
+  const nVoid=filt.length-live.length;
+  const tot=live.reduce((s,t)=>s+(t.net||0),0);
+  const disp=live.filter(t=>txDir(t)==='dispatch'), recv=live.filter(t=>txDir(t)==='receive');
   const dTot=disp.reduce((s,t)=>s+(t.net||0),0), rTot=recv.reduce((s,t)=>s+(t.net||0),0);
   document.getElementById('content').innerHTML=`
     <div class="sec-hd">
-      <div><h2>Records</h2><div class="sub">${filt.length} of ${txs.length} transactions · ${(tot/1000).toFixed(2)} t net${rangeLabel()}</div></div>
+      <div><h2>Records</h2><div class="sub">${live.length} of ${txs.length} transactions · ${(tot/1000).toFixed(2)} t net${nVoid?' · <span style="color:#C62828;font-weight:700">'+nVoid+' void</span>':''}${rangeLabel()}</div></div>
       <div style="display:flex;gap:8px">
         <button class="btn btn-navy btn-sm" onclick="printDailyReport()">🖨 Report</button>
         <button class="btn btn-ghost btn-sm" onclick="exportCSV()">↓ CSV</button>
@@ -8422,6 +8608,10 @@ function renderRecords(){
         <button class="btn btn-ghost btn-sm" onclick="setRange('30')">Last 30 days</button>
         <button class="btn btn-ghost btn-sm" onclick="setRange('month')">This month</button>
         <button class="btn btn-ghost btn-sm" onclick="setRange('all')">All time</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);margin-left:auto;cursor:pointer">
+          <input id="r-void" type="checkbox" ${recFilter.showVoid?'checked':''} onchange="applyFilters()"
+                 style="width:auto;margin:0"/> Show voided
+        </label>
       </div>
       <div class="row2">
         <div><select id="r-cf" onchange="applyFilters()">
@@ -8444,18 +8634,28 @@ function renderRecords(){
     </div>
     <div class="card" style="padding:0;overflow:hidden">
       ${filt.length?`<table><thead><tr><th>Ticket</th><th>Reg</th><th>Product</th><th>Customer</th><th>Net ${u}</th><th>Date/Time</th><th></th></tr></thead>
-        <tbody>${filt.slice(0,200).map(t=>`<tr>
-          <td style="font-family:monospace;font-size:10px;color:var(--text3)">${esc(t.id)}</td>
-          <td><b style="font-family:monospace;letter-spacing:1px">${esc(t.vehicleReg)}</b></td>
-          <td>${esc(t.product||'—')}</td>
-          <td style="font-size:12px">${esc(t.customer||'—')}</td>
-          <td style="font-family:monospace;font-weight:700;color:var(--navy)">${fmt(t.net)}</td>
-          <td style="font-size:11px;color:var(--text3)">${fmtDT(t.completedAt)}</td>
+        <tbody>${filt.slice(0,200).map(t=>{
+          const v=txIsVoid(t), mgr=roleAtLeast('manager');
+          const dim=v?'opacity:.55;text-decoration:line-through':'';
+          return `<tr${v?' style="background:#fff6f6"':''}>
+          <td style="font-family:monospace;font-size:10px;color:var(--text3)">${esc(t.id)}
+            ${v?'<div style="font-family:inherit;font-size:9px;font-weight:900;color:#C62828;letter-spacing:1px">VOID</div>':''}
+            ${(!v&&t.editedAt)?'<div style="font-family:inherit;font-size:9px;color:#B08A3E;letter-spacing:1px">CORRECTED</div>':''}</td>
+          <td style="${dim}"><b style="font-family:monospace;letter-spacing:1px">${esc(t.vehicleReg)}</b></td>
+          <td style="${dim}">${esc(t.product||'—')}</td>
+          <td style="font-size:12px;${dim}">${esc(t.customer||'—')}</td>
+          <td style="font-family:monospace;font-weight:700;color:${v?'#C62828':'var(--navy)'};${dim}">${fmt(t.net)}</td>
+          <td style="font-size:11px;color:var(--text3)">${fmtDT(t.completedAt)}
+            ${v&&t.voidReason?'<div style="font-size:10px;color:#C62828">'+esc(t.voidReason)+'</div>':''}</td>
           <td style="white-space:nowrap">
-            <button class="btn btn-ghost btn-sm" style="margin-right:4px" onclick="reprintThermal('${t.id}')">🧾</button>
-            <button class="btn btn-ghost btn-sm" onclick="reprintA4('${t.id}')">📄</button>
+            <button class="btn btn-ghost btn-sm" style="margin-right:4px" title="Thermal" onclick="reprintThermal('${t.id}')">🧾</button>
+            <button class="btn btn-ghost btn-sm" style="margin-right:4px" title="A4" onclick="reprintA4('${t.id}')">📄</button>
+            ${mgr?(v
+              ?`<button class="btn btn-ghost btn-sm" title="Restore this ticket" onclick="unvoidTicket('${t.id}')">↩</button>`
+              :`<button class="btn btn-ghost btn-sm" style="margin-right:4px" title="Correct this ticket" onclick="editTicket('${t.id}')">✏️</button>
+                <button class="btn btn-ghost btn-sm" title="Void this ticket" onclick="voidTicket('${t.id}')">⛔</button>`):''}
           </td>
-        </tr>`).join('')}</tbody></table>`
+        </tr>`;}).join('')}</tbody></table>`
       :'<div class="empty"><div class="ico">📋</div><p>No records match your filter</p></div>'}
     </div>`;
   // keep the cursor where it was — the search/value boxes rebuild on every keystroke
@@ -8464,7 +8664,7 @@ function renderRecords(){
     if(el&&el.focus){ el.focus(); try{ if(_caret!=null&&el.setSelectionRange) el.setSelectionRange(_caret,_caret); }catch(e){} }
   }
 }
-let recFilter={q:'',from:'',to:'',bridge:'',prod:'',dir:'',cfId:'',cfVal:''};
+let recFilter={q:'',from:'',to:'',bridge:'',prod:'',dir:'',cfId:'',cfVal:'',showVoid:false};
 function applyFilters(){
   recFilter.q=document.getElementById('r-q')?.value||'';
   recFilter.from=document.getElementById('r-from')?.value||'';
@@ -8472,6 +8672,7 @@ function applyFilters(){
   recFilter.bridge=document.getElementById('r-bridge')?.value??'';
   recFilter.prod=document.getElementById('r-prod')?.value||'';
   recFilter.dir=document.getElementById('r-dir')?.value||'';
+  recFilter.showVoid=!!document.getElementById('r-void')?.checked;
   const prevCf=recFilter.cfId;
   recFilter.cfId=document.getElementById('r-cf')?.value||'';
   recFilter.cfVal=document.getElementById('r-cfv')?.value||'';
@@ -8493,6 +8694,7 @@ function setRange(preset){
 }
 function filteredTxs(){
   return txs.filter(t=>{
+    if(txIsVoid(t)&&!recFilter.showVoid) return false;
     if(recFilter.q){
       const cf=(t.custom||[]).map(c=>c.value).join(' ');
       const hay=[t.vehicleReg,t.product,t.customer,t.transporter,t.supplier,t.destination,t.driver,t.id,cf].join(' ').toLowerCase();
@@ -8517,10 +8719,16 @@ function rangeLabel(){
   if(recFilter.to) return ' · up to '+recFilter.to;
   return ' · all dates';
 }
-function reprintThermal(id){const t=txs.find(x=>x.id===id);if(t){auditLog('reprint','tx',id,'Reprinted thermal '+t.vehicleReg);printThermal(t);}}
-function reprintA4(id){const t=txs.find(x=>x.id===id);if(t){auditLog('reprint','tx',id,'Reprinted A4 '+t.vehicleReg);printA4(t);}}
+function _reprintOK(t){
+  if(!txIsVoid(t)) return true;
+  return confirm('Ticket '+t.id+' is VOID.\n\nIt will print with a VOID stamp across it. Continue?');
+}
+function reprintThermal(id){const t=txs.find(x=>x.id===id);if(t&&_reprintOK(t)){auditLog('reprint','tx',id,(txIsVoid(t)?'Reprinted VOID thermal ':'Reprinted thermal ')+t.vehicleReg);printThermal(t);}}
+function reprintA4(id){const t=txs.find(x=>x.id===id);if(t&&_reprintOK(t)){auditLog('reprint','tx',id,(txIsVoid(t)?'Reprinted VOID A4 ':'Reprinted A4 ')+t.vehicleReg);printA4(t);}}
 function exportCSV(){
-  const f=filteredTxs();
+  // Never export a voided ticket, even with "Show voided" ticked on screen —
+  // an export is what leaves the site and gets invoiced against.
+  const f=filteredTxs().filter(t=>!txIsVoid(t));
   if(!f.length){toast('No records','error');return;}
   const u=cfg.weightUnit||'kg';
   const q=v=>{ let s=(v==null?'':String(v)).replace(/\r?\n/g,' '); return '"'+s.replace(/"/g,'""')+'"'; };
@@ -8587,7 +8795,7 @@ function exportCSV(){
   toast('CSV exported — '+f.length+' rows, '+(totNet/1000).toFixed(2)+' t','success');
 }
 function printDailyReport(){
-  const list=filteredTxs();
+  const list=filteredTxs().filter(t=>!txIsVoid(t));
   if(!list.length){toast('No records to report','error');return;}
   const u=cfg.weightUnit||'kg';
   const tot=list.reduce((s,t)=>s+(t.net||0),0);
@@ -9032,15 +9240,22 @@ function txCloudRow(t, status){
   const dir=txDir(t);
   return {
     site:      siteCode(),
-    ticket:    String(t.id||''),
-    row_id:    t.rowId || undefined,
+    // No ticket number exists until weigh-out issues one, so an on-site
+    // truck goes up with ticket NULL. NULLs do not collide in the
+    // (site, ticket) unique index; an empty string does — every truck on
+    // site would fight over the same row.
+    ticket:    String(t.id||'').trim() || null,
+    // row_id is the conflict key, so it must always be there.
+    row_id:    t.rowId || newRowId(),
     reg:       t.vehicleReg||'',
     customer:  t.customer||'',
     product:   t.product||'',
     // 'dispatch' / 'receive'. The dashboard also accepts the older
     // Loading / Off Loading wording that Cloud Sync sends.
     action:    dir||'',
-    status:    status,
+    // A voided ticket is pushed as 'void' rather than withdrawn: the cloud
+    // keeps the row, the dashboard leaves it out of the client's figures.
+    status:    t.voided ? 'void' : status,
     order_no:  txOrderNo(t)||null,
     transporter: t.transporter||null,
     driver:    t.driver||null,
@@ -9078,14 +9293,17 @@ async function syncPushTickets(){
 
   let n=0;
   if(openRows.length){
-    await _sbReq('transactions?on_conflict=site,ticket',{method:'POST',
+    // Keyed on row_id, not (site, ticket): the ticket number is only issued
+    // at weigh-out, so the row that goes up as 'open' has no ticket yet and
+    // must become the same row when it completes — not a second one.
+    await _sbReq('transactions?on_conflict=row_id',{method:'POST',
       headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
       body:JSON.stringify(openRows)});
     n+=openRows.length;
   }
   for(let i=0;i<doneDue.length;i+=100){
     const batch=doneDue.slice(i,i+100);
-    await _sbReq('transactions?on_conflict=site,ticket',{method:'POST',
+    await _sbReq('transactions?on_conflict=row_id',{method:'POST',
       headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
       body:JSON.stringify(batch.map(t=>txCloudRow(t,'complete')))});
     const at=nowISO();
@@ -10562,6 +10780,14 @@ async function sharePull(){
       if(t._deleted||!t.id) return;
       const id=String(t.id);
       const f=fp(t);
+      // A ticket corrected or voided on the other PC carries a higher edit
+      // version. It is the SAME ticket — take it in place rather than letting
+      // the clash rule re-number it into a second copy.
+      const held=have.get(id);
+      if(held && (Number(t._ev)||0) > (Number(held._ev)||0)){
+        Object.keys(held).forEach(k=>{ if(!(k in t)) delete held[k]; });
+        Object.assign(held,t); changed++; return;
+      }
       if(reconciled.has(f)) return;        // already handled this exact record — skip
       if(haveFP.has(f)) return;            // we already hold this transaction (any id) — skip
       const mine=have.get(id);
