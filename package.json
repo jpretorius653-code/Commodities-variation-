@@ -1,7 +1,7 @@
 {
   "name": "commvar-weighbridge",
   "productName": "ISS Weighbridge",
-  "version": "9.8.1",
+  "version": "9.9.0",
   "description": "ISS Weighbridge \u2014 weighbridge control, ticketing and reporting. Industrial Scale Solutions.",
   "author": {
     "name": "Industrial Scale Solutions",
